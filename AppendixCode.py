@@ -12,7 +12,7 @@ import time
 from scipy.linalg import solve_discrete_are
 
 EGO_CAR_SPEED = 7
-TRAINING_TIMESTEPS = 500
+TRAINING_TIMESTEPS = 4096
 MAP_SELECTION = "racetrack-v0"
 MODEL_SAVE_PATH = "TrainedRLPathTrackingModel"
 USE_ROTATING_MAPS = False
@@ -306,48 +306,121 @@ class CalibratedSteeringConstSpeed(gym.ActionWrapper):
 class ObsWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        observation_lower_bounds = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
-        observation_upper_bounds = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-        self.observation_space = spaces.Box(low=observation_lower_bounds, high=observation_upper_bounds, dtype=np.float32)
+        # [ey_norm, sin(epsi), cos(epsi), prev_steer]
+        low  = np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+        high = np.array([ 1.0,  1.0,  1.0,  1.0], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
     def observation(self, _obs):
         lateral_error, heading_error = calculate_frenet_frame_errors(self.env)
-        previous_steering_command = getattr(self.env, "last_steer", 0.0)
+        prev_steer = float(getattr(self.env, "last_steer", 0.0))
 
-        lateral_error_normalization = 2
-        heading_error_normalization = np.pi
+        ey_norm = np.clip(lateral_error / 2.0, -1.0, 1.0)
+        sin_e = float(np.sin(heading_error))
+        cos_e = float(np.cos(heading_error))
 
-        normalized_lateral_error = lateral_error / lateral_error_normalization
-        normalized_heading_error = heading_error / heading_error_normalization
-        normalized_previous_steering = float(previous_steering_command)
-
-        obs = np.array([normalized_lateral_error, normalized_heading_error, normalized_previous_steering], dtype=np.float32)
+        obs = np.array([ey_norm, sin_e, cos_e, prev_steer], dtype=np.float32)
         return np.clip(obs, -1.0, 1.0)
 
 
 class RewardWrapper(gym.Wrapper):
-    def __init__(self, env, weight_lateral_error=1.0, weight_heading_error=5.0, weight_steering_magnitude=0, weight_steering_change=2):
+    def __init__(
+        self,
+        env,
+        weight_lateral_error=1.0,
+        weight_heading_error=5.0,
+        weight_steering_magnitude=0.05,   # <-- small, helps avoid circles
+        weight_steering_change=2.0,
+        weight_progress=1.0,              # <-- NEW: reward forward progress
+        weight_wrong_way=2.0,             # <-- NEW: penalize reverse progress
+    ):
         super().__init__(env)
         self.weight_lateral_error = weight_lateral_error
         self.weight_heading_error = weight_heading_error
         self.weight_steering_magnitude = weight_steering_magnitude
         self.weight_steering_change = weight_steering_change
+        self.weight_progress = weight_progress
+        self.weight_wrong_way = weight_wrong_way
+
+        self._last_s = None
+        self._last_lane_length = None
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+
+        # Initialize last_s on reset so first step doesn't get a crazy delta
+        base = self.env.unwrapped
+        ego = base.vehicle
+        net = base.road.network
+        lane = net.get_lane(net.get_closest_lane_index(ego.position))
+        s, _ = lane.local_coordinates(ego.position)
+
+        self._last_s = float(s)
+        self._last_lane_length = float(lane.length)
+        return obs
+
+    def _wrapped_ds(self, s_now: float, s_prev: float, lane_length: float) -> float:
+        """
+        Wrap delta-s into [-L/2, L/2] so loop tracks behave correctly.
+        """
+        ds = s_now - s_prev
+        # wrap to [-L/2, L/2]
+        ds = (ds + 0.5 * lane_length) % lane_length - 0.5 * lane_length
+        return float(ds)
 
     def step(self, action):
         previous_steering_command = getattr(self.env, "last_steer", 0.0)
         current_steering_command = np.clip(float(np.asarray(action).ravel()[0]), -1.0, 1.0)
 
         observation, _, terminated, truncated, info = self.env.step(action)
+
+        # Tracking errors (same as before)
         lateral_error, heading_error = calculate_frenet_frame_errors(self.env)
 
-        tracking_error_penalty = self.weight_lateral_error * abs(lateral_error) + self.weight_heading_error * abs(heading_error)
+        # Progress along lane (s)
+        base = self.env.unwrapped
+        ego = base.vehicle
+        net = base.road.network
+        lane = net.get_lane(net.get_closest_lane_index(ego.position))
+        s_now, _ = lane.local_coordinates(ego.position)
+
+        # Initialize if somehow missing
+        if self._last_s is None:
+            self._last_s = float(s_now)
+            self._last_lane_length = float(lane.length)
+
+        lane_length = float(lane.length)
+        ds = self._wrapped_ds(float(s_now), float(self._last_s), lane_length)
+
+        # Update stored s
+        self._last_s = float(s_now)
+        self._last_lane_length = lane_length
+
+        # Penalties (same idea as before)
+        tracking_error_penalty = (
+            self.weight_lateral_error * abs(lateral_error)
+            + self.weight_heading_error * abs(heading_error)
+        )
         steering_magnitude_penalty = self.weight_steering_magnitude * abs(current_steering_command)
         steering_change_penalty = self.weight_steering_change * abs(current_steering_command - previous_steering_command)
 
         is_off_road = not self.env.unwrapped.vehicle.on_road
         off_road_penalty = 10.0 if is_off_road else 0.0
 
-        reward = -(tracking_error_penalty + steering_magnitude_penalty + steering_change_penalty + off_road_penalty)
+        # NEW: progress reward + wrong-way penalty
+        # Forward progress: ds > 0
+        progress_reward = self.weight_progress * max(ds, 0.0)
+        wrong_way_penalty = self.weight_wrong_way * max(-ds, 0.0)
+
+        reward = (
+            progress_reward
+            - wrong_way_penalty
+            - tracking_error_penalty
+            - steering_magnitude_penalty
+            - steering_change_penalty
+            - off_road_penalty
+        )
+
         return observation, float(reward), terminated, truncated, info
 
 
@@ -481,6 +554,8 @@ def train_algo(algo_name: str, total_timesteps: int, base_save_path: str, v_ref:
                 "MlpPolicy",
                 train_env,
                 verbose=0,
+                n_steps=256,
+                batch_size=64,
                 policy_kwargs=dict(net_arch=[64, 64]),
                 seed=SEED,
             )
@@ -548,7 +623,10 @@ def evaluate_algo(algo_name: str, model_path: str, v_ref: float, max_duration: f
             if t > max_duration:
                 break
             if terminated or truncated:
-                break
+            #obs, _ = env.reset()
+            # optionally re-init ghost too:
+            # ghost, ghost_controller, ghost_L = init_ghost(env, v_ghost=v_ref, start_advance=15.0, dt_default=1/15.0)
+                continue
 
     except KeyboardInterrupt:
         pass
@@ -620,6 +698,9 @@ def main(total_timesteps=TRAINING_TIMESTEPS, save_path=MODEL_SAVE_PATH, v_ref=EG
     #for algo in ALGOS_TO_RUN:
     #    model_path = train_algo(algo, total_timesteps=total_timesteps, base_save_path=save_path, v_ref=v_ref)
     #    results[algo] = evaluate_algo(algo, model_path=model_path, v_ref=v_ref, max_duration=30.0)
+    
+    #results[0] = evaluate_algo('ddpg', model_path="/home/linfu/grad/syde675/project/learning_based_path_tracking/TrainedRLPathTrackingModel_ddpg.zip", v_ref=v_ref, max_duration=30.0)
+    #results[1] = evaluate_algo('ppo', model_path="/home/linfu/grad/syde675/project/learning_based_path_tracking/TrainedRLPathTrackingModel_ppo.zip", v_ref=v_ref, max_duration=30.0)
 
     model_path = train_algo('ppo', total_timesteps=total_timesteps, base_save_path=save_path, v_ref=v_ref)
     results['ppo'] = evaluate_algo('ppo', model_path=model_path, v_ref=v_ref, max_duration=30.0)
