@@ -12,7 +12,7 @@ import time
 from scipy.linalg import solve_discrete_are
 
 EGO_CAR_SPEED = 7
-TRAINING_TIMESTEPS = 50000
+TRAINING_TIMESTEPS = 500
 MAP_SELECTION = "racetrack-v0"
 MODEL_SAVE_PATH = "TrainedRLPathTrackingModel"
 USE_ROTATING_MAPS = False
@@ -706,11 +706,12 @@ def main(total_timesteps=TRAINING_TIMESTEPS, save_path=MODEL_SAVE_PATH, v_ref=EG
     #    model_path = train_algo(algo, total_timesteps=total_timesteps, base_save_path=save_path, v_ref=v_ref)
     #    results[algo] = evaluate_algo(algo, model_path=model_path, v_ref=v_ref, max_duration=30.0)
     
-    #results[0] = evaluate_algo('ddpg', model_path="/home/linfu/grad/syde675/project/learning_based_path_tracking/TrainedRLPathTrackingModel_ddpg.zip", v_ref=v_ref, max_duration=30.0)
-    #results[1] = evaluate_algo('ppo', model_path="/home/linfu/grad/syde675/project/learning_based_path_tracking/TrainedRLPathTrackingModel_ppo.zip", v_ref=v_ref, max_duration=30.0)
+    #model_path = train_algo('ddpg', total_timesteps=total_timesteps, base_save_path=save_path, v_ref=v_ref)
+    results['ddpg'] = evaluate_algo('ddpg', model_path="/home/linfu/grad/syde675/project/learning_based_path_tracking/TrainedRLPathTrackingModel_ddpg.zip", v_ref=v_ref, max_duration=30.0)
+    results['ppo'] = evaluate_algo('ppo', model_path="/home/linfu/grad/syde675/project/learning_based_path_tracking/TrainedRLPathTrackingModel_ppo.zip", v_ref=v_ref, max_duration=30.0)
 
-    model_path = train_algo('ppo', total_timesteps=total_timesteps, base_save_path=save_path, v_ref=v_ref)
-    results['ppo'] = evaluate_algo('ppo', model_path=model_path, v_ref=v_ref, max_duration=30.0)
+    #model_path = train_algo('ppo', total_timesteps=total_timesteps, base_save_path=save_path, v_ref=v_ref)
+    #results['ppo'] = evaluate_algo('ppo', model_path=model_path, v_ref=v_ref, max_duration=30.0)
 
     # 2) Combined plots (DDPG vs PPO vs LQR) if both exist
     if "ddpg" in results and "ppo" in results:
@@ -738,7 +739,7 @@ def main(total_timesteps=TRAINING_TIMESTEPS, save_path=MODEL_SAVE_PATH, v_ref=EG
         plt.legend()
         plt.savefig("combined_heading_error_vs_time.png", dpi=300, bbox_inches="tight")
 
-    # 3) Print summary
+    # 3) Print summarya
     print("\n===== Summary =====")
     for algo, r in results.items():
         print(
