@@ -12,11 +12,12 @@ import time
 from scipy.linalg import solve_discrete_are
 
 EGO_CAR_SPEED = 7
-TRAINING_TIMESTEPS = 4096
+TRAINING_TIMESTEPS = 50000
 MAP_SELECTION = "racetrack-v0"
 MODEL_SAVE_PATH = "TrainedRLPathTrackingModel"
 USE_ROTATING_MAPS = False
 TRAINING_MAPS = ["highway-v0", "racetrack-v0"]
+LOAD_EXISTING_MODELS = False
 
 # Run sequentially
 ALGOS_TO_RUN = ["ddpg", "ppo"]  # order matters
@@ -28,7 +29,7 @@ def calculate_frenet_frame_errors(env):
     ego = base.vehicle
     road = base.road.network
 
-    lane = road.get_lane(road.get_closest_lane_index(ego.position))
+    lane = road.get_lane(road.get_closest_lane_index(ego.position, ego.heading))
 
     longitudinal_position, lateral_error = lane.local_coordinates(ego.position)
     path_heading = lane.heading_at(longitudinal_position)
@@ -38,7 +39,7 @@ def calculate_frenet_frame_errors(env):
 
 def calculate_frenet_frame_errors_ghost(base_env, position, heading, return_kappa=False):
     road = base_env.road.network
-    lane = road.get_lane(road.get_closest_lane_index(position))
+    lane = road.get_lane(road.get_closest_lane_index(position, heading))
 
     longitudinal_position, lateral_error = lane.local_coordinates(position)
     path_heading = lane.heading_at(longitudinal_position)
@@ -63,7 +64,7 @@ def init_ghost(env, v_ghost=EGO_CAR_SPEED, start_advance=15.0, dt_default=1 / 15
     road = base.road
     net = road.network
 
-    lane = net.get_lane(net.get_closest_lane_index(ego.position))
+    lane = net.get_lane(net.get_closest_lane_index(ego.position, ego.heading))
 
     long_ego, _ = lane.local_coordinates(ego.position)
     x_ghost, y_ghost = lane.position((long_ego + start_advance) % lane.length, 0)
@@ -105,7 +106,7 @@ def update_ghost(env, ghost, controller, L, dt=1 / 15.0):
     ghost.position[0] += ghost.speed * np.cos(ghost.heading) * dt
     ghost.position[1] += ghost.speed * np.sin(ghost.heading) * dt
 
-    ghost.lane_index = road.network.get_closest_lane_index(ghost.position)
+    ghost.lane_index = road.network.get_closest_lane_index(ghost.position, ghost.heading)
 
 
 class AlgoLossCallback(BaseCallback):
@@ -331,16 +332,16 @@ class RewardWrapper(gym.Wrapper):
         weight_heading_error=5.0,
         weight_steering_magnitude=0.05,   # <-- small, helps avoid circles
         weight_steering_change=2.0,
-        weight_progress=1.0,              # <-- NEW: reward forward progress
-        weight_wrong_way=2.0,             # <-- NEW: penalize reverse progress
+        weight_forward_speed=0.4,
+        weight_reverse_speed=1.2,
     ):
         super().__init__(env)
         self.weight_lateral_error = weight_lateral_error
         self.weight_heading_error = weight_heading_error
         self.weight_steering_magnitude = weight_steering_magnitude
         self.weight_steering_change = weight_steering_change
-        self.weight_progress = weight_progress
-        self.weight_wrong_way = weight_wrong_way
+        self.weight_forward_speed = weight_forward_speed
+        self.weight_reverse_speed = weight_reverse_speed
 
         self._last_s = None
         self._last_lane_length = None
@@ -352,7 +353,7 @@ class RewardWrapper(gym.Wrapper):
         base = self.env.unwrapped
         ego = base.vehicle
         net = base.road.network
-        lane = net.get_lane(net.get_closest_lane_index(ego.position))
+        lane = net.get_lane(net.get_closest_lane_index(ego.position, ego.heading))
         s, _ = lane.local_coordinates(ego.position)
 
         self._last_s = float(s)
@@ -381,7 +382,7 @@ class RewardWrapper(gym.Wrapper):
         base = self.env.unwrapped
         ego = base.vehicle
         net = base.road.network
-        lane = net.get_lane(net.get_closest_lane_index(ego.position))
+        lane = net.get_lane(net.get_closest_lane_index(ego.position, ego.heading))
         s_now, _ = lane.local_coordinates(ego.position)
 
         # Initialize if somehow missing
@@ -391,6 +392,10 @@ class RewardWrapper(gym.Wrapper):
 
         lane_length = float(lane.length)
         ds = self._wrapped_ds(float(s_now), float(self._last_s), lane_length)
+
+        lane_heading = lane.heading_at(float(s_now))
+        lane_tangent = np.array([np.cos(lane_heading), np.sin(lane_heading)], dtype=np.float32)
+        signed_forward_speed = float(ego.velocity @ lane_tangent)
 
         # Update stored s
         self._last_s = float(s_now)
@@ -407,14 +412,12 @@ class RewardWrapper(gym.Wrapper):
         is_off_road = not self.env.unwrapped.vehicle.on_road
         off_road_penalty = 10.0 if is_off_road else 0.0
 
-        # NEW: progress reward + wrong-way penalty
-        # Forward progress: ds > 0
-        progress_reward = self.weight_progress * max(ds, 0.0)
-        wrong_way_penalty = self.weight_wrong_way * max(-ds, 0.0)
+        forward_speed_reward = self.weight_forward_speed * max(signed_forward_speed, 0.0)
+        reverse_speed_penalty = self.weight_reverse_speed * max(-signed_forward_speed, 0.0)
 
         reward = (
-            progress_reward
-            - wrong_way_penalty
+            forward_speed_reward
+            - reverse_speed_penalty
             - tracking_error_penalty
             - steering_magnitude_penalty
             - steering_change_penalty
@@ -531,11 +534,13 @@ def train_algo(algo_name: str, total_timesteps: int, base_save_path: str, v_ref:
     if algo == "ddpg":
         noise = NormalActionNoise(mean=np.array([0.0], dtype=np.float32), sigma=np.array([0.05], dtype=np.float32))
 
-        if os.path.exists(f"{save_path}.zip"):
+        if LOAD_EXISTING_MODELS and os.path.exists(f"{save_path}.zip"):
             print(f"[DDPG] Loading existing model: {save_path}.zip")
             model = DDPG.load(save_path, env=train_env)
             model.action_noise = noise
         else:
+            if os.path.exists(f"{save_path}.zip"):
+                print(f"[DDPG] Existing model found at {save_path}.zip but training from scratch.")
             model = DDPG(
                 "MlpPolicy",
                 train_env,
@@ -546,10 +551,12 @@ def train_algo(algo_name: str, total_timesteps: int, base_save_path: str, v_ref:
             )
 
     elif algo == "ppo":
-        if os.path.exists(f"{save_path}.zip"):
+        if LOAD_EXISTING_MODELS and os.path.exists(f"{save_path}.zip"):
             print(f"[PPO] Loading existing model: {save_path}.zip")
             model = PPO.load(save_path, env=train_env)
         else:
+            if os.path.exists(f"{save_path}.zip"):
+                print(f"[PPO] Existing model found at {save_path}.zip but training from scratch.")
             model = PPO(
                 "MlpPolicy",
                 train_env,
